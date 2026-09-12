@@ -1,11 +1,11 @@
 from __future__ import annotations
-import ctypes, collections, dataclasses, functools, hashlib, array
-from tinygrad.helpers import mv_address, getenv, DEBUG, fetch, lo32, hi32
-from tinygrad.runtime.autogen.am import am
-from tinygrad.runtime.support.hcq import MMIOInterface
+import ctypes, collections, dataclasses, functools, hashlib, array, contextlib
+from tinygrad.helpers import mv_address, getenv, DEBUG, lo32, hi32, fetch_fw, to_mv, wait_cond
+from tinygrad.runtime.autogen import pci
+from tinygrad.runtime.autogen.am import am, fw
 from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
-from tinygrad.runtime.support.system import PCIDevice, PCIDevImplBase
+from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
@@ -14,10 +14,11 @@ AM_DEBUG = getenv("AM_DEBUG", 0)
 class AMRegister(AMDReg):
   adev:AMDev
 
-  def read(self, inst=0): return self.adev.rreg(self.addr[inst])
+  def read(self, inst=0, direct=False): return self.adev.rreg(self.addr[inst], inst=inst, direct=direct)
   def read_bitfields(self, inst=0) -> dict[str, int]: return self.decode(self.read(inst=inst))
 
-  def write(self, _am_val:int=0, inst=0, **kwargs): self.adev.wreg(self.addr[inst], _am_val | self.encode(**kwargs))
+  def write(self, _am_val:int=0, inst=0, direct=False, **kwargs):
+    self.adev.wreg(self.addr[inst], _am_val|self.encode(**kwargs), inst=inst, direct=direct)
 
   def update(self, inst=0, **kwargs): self.write(self.read(inst=inst) & ~self.fields_mask(*kwargs.keys()), inst=inst, **kwargs)
 
@@ -32,7 +33,7 @@ class AMFirmware:
     blob, sos_hdr = self.load_fw(f"psp_{fmt_ver(am.MP0_HWIP)}_sos.bin", versioned_header='struct_psp_firmware_header')
     fw_bin = sos_hdr.psp_fw_bin
 
-    for fw_i in range(sos_hdr.psp_fw_bin_count):
+    for fw_i in range(sos_hdr.psp_aux_fw_bin_index if sos_hdr.header.header_version_minor == 1 else sos_hdr.psp_fw_bin_count):
       fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(fw_bin) + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
       ucode_start_offset = fw_bin_desc.offset_bytes + sos_hdr.header.ucode_array_offset_bytes
       self.sos_fw[fw_bin_desc.fw_type] = blob[ucode_start_offset:ucode_start_offset+fw_bin_desc.size_bytes]
@@ -108,8 +109,7 @@ class AMFirmware:
     self.descs += [self.desc(blob, hdr0.header.ucode_array_offset_bytes, hdr0.header.ucode_size_bytes, am.GFX_FW_TYPE_RLC_G)]
 
   def load_fw(self, fname:str, *headers, versioned_header:str|None=None):
-    fpath = fetch(f"https://gitlab.com/kernel-firmware/linux-firmware/-/raw/1e2c15348485939baf1b6d1f5a7a3b799d80703d/amdgpu/{fname}", subdir="fw")
-    blob = memoryview(bytearray(fpath.read_bytes()))
+    blob = memoryview(bytearray(fetch_fw("amdgpu", fname, fw.hashes[fname])))
     if AM_DEBUG >= 1: print(f"am {self.adev.devfmt}: loading firmware {fname}: {hashlib.sha256(blob).hexdigest()}")
     if versioned_header:
       chdr = am.struct_common_firmware_header.from_address(mv_address(blob))
@@ -143,12 +143,28 @@ class AMMemoryManager(MemoryManager):
     self.dev.gmc.flush_tlb(ip='GC', vmid=0)
     self.dev.gmc.flush_tlb(ip='MM', vmid=0)
 
-class AMDev(PCIDevImplBase):
-  Version = 0xA0000008
+class AMDev:
+  Version = 0xA000000D
 
-  def __init__(self, pci_dev:PCIDevice, dma_regions:list[tuple[int, MMIOInterface]]|None=None, reset_mode=False):
-    self.pci_dev, self.devfmt, self.dma_regions = pci_dev, pci_dev.pcibus, dma_regions
+  def _disable_aspm(self):
+    # L1 across retimers makes reads oscillate to 0xffffffff; power on defaults it enabled. Clearing the GPU endpoint
+    # alone suffices: L1 only engages when both ends of the link enable it.
+    cap, seen = self.pci_dev.read_config(0x34, 1) & 0xfc, set() # bound the walk: a dead link can return 0xff pointers forever
+    while cap and cap not in seen and self.pci_dev.read_config(cap, 1) != 0x10:
+      seen.add(cap)
+      cap = self.pci_dev.read_config(cap + 1, 1) & 0xfc
+    if cap and cap not in seen: self.pci_dev.write_config_flush(cap + 0x10, self.pci_dev.read_config(cap + 0x10, 2) & ~3, 2) # PCIe cap lnkctl
+
+  def __init__(self, pci_dev:PCIDevice, reset_mode=False):
+    self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
+    self._disable_aspm()
     self.vram, self.doorbell64, self.mmio = self.pci_dev.map_bar(0), self.pci_dev.map_bar(2, fmt='Q'), self.pci_dev.map_bar(5, fmt='I')
+
+    # VF related
+    self.is_vf = bool(self.mmio[am.mmRCC_IOV_FUNC_IDENTIFIER] & 1)
+    self.vf_mailbox = self.mmio.view(am.NV_MAIBOX_CONTROL_TRN_OFFSET_BYTE, 2, fmt='B')
+    self.vf_access = self._vf_mailbox_request(am.IDH_REQ_GPU_INIT_ACCESS) if self.is_vf else 0
+    self.vf_rlc_gated:list[tuple[int, int]] = []
 
     self._run_discovery()
     self._build_regs()
@@ -171,14 +187,20 @@ class AMDev(PCIDevImplBase):
       if DEBUG >= 2: print(f"am {self.devfmt}: Malformed state. Issuing a full reset.")
       self.partial_boot = False
 
+    # aqua (gc 9.5.0): full boot over live state can kill the fabric (power cycle recovers); partial boot+reset_mec is the deepest safe reset
+    if self.ip_ver[am.GC_HWIP] == (9,5,0) and self.reg("regSCRATCH_REG7").read() == AMDev.Version: self.partial_boot = True
+
     # Init hw for IP blocks where it is needed
     if not self.partial_boot:
-      if self.psp.is_sos_alive() and self.smu.is_smu_alive():
+      if not self.is_vf and self.psp.is_sos_alive() and self.smu.is_smu_alive(): # skip in vf mode, these are pf funcs.
+        self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
         if self.is_hive():
           if reset_mode: return # in reset mode, do not raise
           raise RuntimeError("Malformed state. Use extra/amdpci/hive_reset.py to reset the hive")
         self.smu.mode1_reset()
-      self.init_hw(self.soc, self.gmc, self.ih, self.psp, self.smu)
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
+      self.init_hw(self.soc, self.gmc, self.ih, *(() if self.is_vf else (self.psp, self.smu)))
+    elif not self.is_vf: self.psp._tmr_init()
 
     # Booting done
     self.is_booting = False
@@ -186,19 +208,25 @@ class AMDev(PCIDevImplBase):
     # Re-initialize main blocks
     self.init_hw(self.gfx, self.sdma)
 
-    self.smu.set_clocks(level=-1) # last level, max perf.
-    for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
-    self.reg("regSCRATCH_REG7").write(AMDev.Version)
-    self.reg("regSCRATCH_REG6").write(1) # set initialized state.
+    if not self.is_vf: # skip in vf mode, these are pf funcs.
+      if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
+        self.smu.set_power_limit(max_power)
+        self.smu.set_clocks(level=None)
+      else: self.smu.set_clocks(level=-1) # last level, max perf.
+      for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
+      self.reg("regSCRATCH_REG5").write(self.psp.tmr_size) # scratch registers are writable after GFX initialization
+      self.reg("regSCRATCH_REG7").write(AMDev.Version)
+      self.reg("regSCRATCH_REG6").write(1) # set initialized state.
+
     if DEBUG >= 2: print(f"am {self.devfmt}: boot done")
 
   def init_sw(self, smi_dev=False):
     self.smi_dev, self.is_err_state = smi_dev, False
 
     # Memory manager & firmware
-    self.mm = AMMemoryManager(self, self.vram_size - self.reserved_vram_size, boot_size=(32 << 20), pt_t=AMPageTableEntry, va_shifts=[12, 21, 30, 39],
-      va_bits=48, first_lv=am.AMDGPU_VM_PDB2, va_base=AMMemoryManager.va_allocator.base,
-      palloc_ranges=[(1 << (i + 12), 0x1000) for i in range(9 * (3 - am.AMDGPU_VM_PDB2), -1, -1)], reserve_ptable=not self.large_bar)
+    self.mm = AMMemoryManager(self, self.vram_size - self.reserved_vram_size, boot_size=(3 << 20), pt_t=AMPageTableEntry, va_shifts=[12, 21, 30, 39],
+      va_bits=48, first_lv=am.AMDGPU_VM_PDB2, va_base=AMMemoryManager.va_allocator.base, reserve_ptable=not self.large_bar,
+      palloc_ranges=[(1 << (i + 12), (2 << 20) if i >= 9 else 0x1000) for i in range(9 * (3 - am.AMDGPU_VM_PDB2), -1, -1)])
     self.fw = AMFirmware(self)
 
     # Initialize IP blocks
@@ -220,12 +248,45 @@ class AMDev(PCIDevImplBase):
 
   def fini(self):
     if DEBUG >= 2: print(f"am {self.devfmt}: Finalizing")
+    # a VF may only touch the engines inside an access window, take one so the host does not have to FLR the VF later
+    if self.is_vf and not self.vf_access:
+      with contextlib.suppress(TimeoutError): self.vf_access = self._vf_mailbox_request(am.IDH_REQ_GPU_FINI_ACCESS)
     for ip in [self.sdma, self.gfx]: ip.fini_hw()
-    self.smu.set_clocks(level=0)
+    if not self.is_vf: self.smu.set_clocks(level=0)
     self.ih.interrupt_handler()
-    self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
+    if not self.is_vf: self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
+    if self.vf_access: self.release_vf_access()
 
-  def is_hive(self) -> bool: return self.gmc.xgmi_seg_sz > 0
+  def release_vf_access(self):
+    rel, self.vf_access = self.vf_access, 0 # give back the same lease that was taken
+    with contextlib.suppress(TimeoutError): self._vf_mailbox_request(rel, wait_ready=False)
+
+  def _vf_mailbox_request(self, req:int, wait_ready=True) -> int:
+    self.vf_mailbox[0] = 0 # drop TRN_MSG_VALID
+
+    wait_cond(lambda: self.vf_mailbox[0] & 2, value=0, timeout_ms=1000, msg="VF mailbox acknowledgement did not clear")
+    for i, val in enumerate((req, 0, 0, 0)): self.mmio[am.mmMAILBOX_MSGBUF_TRN_DW0 + i] = val
+
+    self.vf_mailbox[0] = 1 # set TRN_MSG_VALID
+    wait_cond(lambda: self.vf_mailbox[0] & 2, value=2, timeout_ms=am.NV_MAILBOX_POLL_ACK_TIMEDOUT, msg=f"VF mailbox request {req:#x} was not acked")
+    self.vf_mailbox[0] = 0
+    if wait_ready:
+      wait_cond(lambda: self.mmio[am.mmMAILBOX_MSGBUF_RCV_DW0], value=am.IDH_READY_TO_ACCESS_GPU, timeout_ms=am.NV_MAILBOX_POLL_MSG_TIMEDOUT,
+                msg="VF mailbox: the pf never granted access")
+      self.vf_mailbox[1] = 2 # ack
+    return req + 1
+
+  def recover(self, force=False) -> bool:
+    if not force and not self.is_err_state: return False
+    if DEBUG >= 3: print(f"am {self.devfmt}: Start recovery")
+    self.ih.interrupt_handler()
+    self.gfx.reset_mec()
+    self.is_err_state = False
+    if DEBUG >= 3: print(f"am {self.devfmt}: Recovery complete")
+    return True
+
+  # a hive has multiple XGMI regions; single-node parts (like MI350P) may still program LFB_SIZE with region 0 only
+  def is_hive(self) -> bool: return self.gmc.xgmi_seg_sz > 0 and self.gmc.xgmi_max_region > 0
 
   def paddr2mc(self, paddr:int) -> int: return self.gmc.mc_base + paddr
   def paddr2xgmi(self, paddr:int) -> int: return self.gmc.paddr_base + paddr
@@ -233,20 +294,36 @@ class AMDev(PCIDevImplBase):
 
   def reg(self, reg:str) -> AMRegister: return self.__dict__[reg]
 
-  def rreg(self, reg:int) -> int:
-    val = self.indirect_rreg(reg) if reg > len(self.mmio) else self.mmio[reg]
+  def rreg(self, reg:int, inst=0, direct=False) -> int:
+    if not direct and any(lo <= reg <= hi for lo, hi in self.vf_rlc_gated): return self.rlcg_rw(reg, 0, inst, read=True)
+    val = self.indirect_rreg(reg) if reg >= len(self.mmio) else self.mmio[reg]
     if AM_DEBUG >= 4 and getattr(self, '_prev_rreg', None) != (reg, val): print(f"am {self.devfmt}: Reading register {reg:#x} with value {val:#x}")
     self._prev_rreg = (reg, val)
     return val
 
-  def wreg(self, reg:int, val:int):
+  def wreg(self, reg:int, val:int, inst=0, direct=False):
     if AM_DEBUG >= 4: print(f"am {self.devfmt}: Writing register {reg:#x} with value {val:#x}")
-    if reg > len(self.mmio): self.indirect_wreg(reg, val)
+    if not direct and any(lo <= reg <= hi for lo, hi in self.vf_rlc_gated): self.rlcg_rw(reg, val, inst)
+    elif reg >= len(self.mmio): self.indirect_wreg(reg, val)
     else: self.mmio[reg] = val
 
-  def wreg_pair(self, reg_base:str, lo_suffix:str, hi_suffix:str, val:int, inst:int=0):
-    self.reg(f"{reg_base}{lo_suffix}").write(val & 0xffffffff, inst=inst)
-    self.reg(f"{reg_base}{hi_suffix}").write(val >> 32, inst=inst)
+  def rlcg_rw(self, addr:int, val:int, inst:int, read=False) -> int:
+    # the rlc gateway takes the grbm selection through its own scratch registers
+    if addr in {self.reg("regGRBM_GFX_CNTL").addr[inst], self.reg("regGRBM_GFX_INDEX").addr[inst]}:
+      self.reg("regSCRATCH_REG2" if addr == self.reg("regGRBM_GFX_CNTL").addr[inst] else "regSCRATCH_REG3").write(val, inst=inst, direct=True)
+      return val
+
+    self.wreg_pair("regSCRATCH_REG", "0", "1", (addr | (0x1 << 28 if read else 0)) << 32 | val, inst=inst, direct=True)
+    self.reg("regRLC_SPARE_INT").write(1, inst=inst, direct=True)
+    wait_cond(lambda: self.reg("regSCRATCH_REG1").read(inst=inst, direct=True) & 0xFFFFF, value=0, msg=f"RLC gateway timeout on {addr:#x}")
+
+    if AM_DEBUG >= 1 and (err:=self.reg("regSCRATCH_REG1").read(inst=inst, direct=True) & 0xF000000):
+      print(f"am {self.devfmt}: RLC gateway refused {addr:#x}: {err:#x}")
+    return self.reg("regSCRATCH_REG0").read(inst=inst, direct=True)
+
+  def wreg_pair(self, reg_base:str, lo_suffix:str, hi_suffix:str, val:int, inst:int=0, direct=False):
+    self.reg(f"{reg_base}{lo_suffix}").write(lo32(val), inst=inst, direct=direct)
+    self.reg(f"{reg_base}{hi_suffix}").write(hi32(val), inst=inst, direct=direct)
 
   def indirect_rreg(self, reg:int) -> int:
     self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
@@ -259,9 +336,9 @@ class AMDev(PCIDevImplBase):
   def indirect_wreg_pcie(self, reg:int, val:int, aid:int=0):
     reg_addr = reg * 4 + ((((aid & 0b11) << 32) | (1 << 34)) if aid > 0 else 0)
     self.reg("regBIF_BX0_PCIE_INDEX2").write(lo32(reg_addr))
-    if reg_addr >> 32: self.reg("regBIF_BX0_PCIE_INDEX2_HI").write(hi32(reg_addr) & 0xff)
+    if hi32(reg_addr) > 0: self.reg("regBIF_BX0_PCIE_INDEX2_HI").write(hi32(reg_addr) & 0xff)
     self.reg("regBIF_BX0_PCIE_DATA2").write(val)
-    if reg_addr >> 32: self.reg("regBIF_BX0_PCIE_INDEX2_HI").write(0)
+    if hi32(reg_addr) > 0: self.reg("regBIF_BX0_PCIE_INDEX2_HI").write(0)
 
   def _read_vram(self, addr, size) -> bytes:
     assert addr % 4 == 0 and size % 4 == 0, f"Invalid address {addr:#x} or size {size:#x}"
@@ -302,11 +379,23 @@ class AMDev(PCIDevImplBase):
 
         ip_offset += 8 + (8 if ihdr.base_addr_64_bit else 4) * ip.num_base_address
 
+    # HARV(EST) table: harvested instances must be excluded (like amdgpu_discovery_harvest_ip)
+    # layout: u32 signature, u16 version, u16 size, then 32 entries of {hw_id:u16, inst:u8, rsv:u8}
+    self.harvested:dict[int, set[int]] = collections.defaultdict(set)
+    if (harv_off:=self.bhdr.table_list[am.HARVEST_INFO].offset) != 0 and \
+       (blob:=to_mv(ctypes.addressof(self.bhdr) + harv_off, 8 + 32*4).cast('I'))[0] == am.HARVEST_TABLE_SIGNATURE:
+      inv_hw_id = {hw_id: hw_ip for hw_ip, hw_id in am.hw_id_map.items()}
+      for ent in blob[2:]:
+        if (ip_:=inv_hw_id.get(ent & 0xffff)) is not None: self.harvested[ip_].add((ent >> 16) & 0xff)
+
     gc_info = am.struct_gc_info_v1_0.from_address(gc_addr:=ctypes.addressof(self.bhdr) + self.bhdr.table_list[am.GC].offset)
     self.gc_info = getattr(am, f"struct_gc_info_v{gc_info.header.version_major}_{gc_info.header.version_minor}").from_address(gc_addr)
     self.reserved_vram_size = (384 << 20) if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else (64 << 20)
 
-  def _ip_module(self, prefix:str, hwip, prever_prefix:str=""): return import_module(prefix, self.ip_ver[hwip], prever_prefix)
+  @functools.cached_property
+  def hwid_names(self) -> dict[int, str]: return {v:k.removesuffix('_HWID') for k,v in vars(am).items() if k.endswith('_HWID') and isinstance(v, int)}
+
+  def _ip_module(self, prefix:str, hwip): return import_module(prefix, self.ip_ver[hwip])
 
   def _build_regs(self):
     mods = [("mp", am.MP0_HWIP), ("hdp", am.HDP_HWIP), ("gc", am.GC_HWIP), ("mmhub", am.MMHUB_HWIP), ("osssys", am.OSSSYS_HWIP),
@@ -314,5 +403,15 @@ class AMDev(PCIDevImplBase):
     if self.ip_ver[am.SDMA0_HWIP] in {(4,4,2), (4,4,4)}: mods += [("sdma", am.SDMA0_HWIP)]
 
     for prefix, hwip in mods:
-      self.__dict__.update(import_asic_regs(prefix, self.ip_ver[hwip], cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[hwip])))
-    self.__dict__.update(import_asic_regs('mp', (11, 0), cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[am.MP1_HWIP])))
+      regs = import_asic_regs(prefix, self.ip_ver[hwip], cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[hwip]))
+      self.__dict__.update(regs)
+      if prefix == "gc" and self.is_vf:
+        ext = {seg: max(r.offset for r in regs.values() if r.segment == seg) for seg in {r.segment for r in regs.values()}}
+        self.vf_rlc_gated = sorted((bases[seg], bases[seg] + off) for bases in self.regs_offset[hwip].values() for seg, off in ext.items())
+    self.__dict__.update(import_asic_regs('mp', (11, 0, 0), cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[am.MP1_HWIP])))
+
+    # Live AIDs like the kernel: 4 SDMAs per AID; the AID lives iff its group's alive-mask is 0xf/0x3/0xc.
+    # Dead AIDs must never be touched via the indirect window: writes poison the whole fabric.
+    live_sdma = {k for k in self.regs_offset[am.SDMA0_HWIP] if k not in self.harvested[am.SDMA0_HWIP]}
+    max_aid = max((k >> 2 for k in self.regs_offset[am.SDMA0_HWIP]), default=0)
+    self.aids = [0] + [aid for aid in range(1, max_aid + 1) if sum(1 << (i & 3) for i in live_sdma if i >> 2 == aid) in {0xf, 0x3, 0xc}]

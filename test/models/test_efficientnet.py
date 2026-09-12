@@ -3,7 +3,7 @@ import ast, pathlib, unittest
 import numpy as np
 from PIL import Image
 
-from tinygrad import Tensor
+from tinygrad import Tensor, Context
 from tinygrad.helpers import getenv
 from test.helpers import slow
 from extra.models.efficientnet import EfficientNet
@@ -40,7 +40,7 @@ def preprocess(img, new=False):
   return img
 
 def _infer(model: EfficientNet, img):
-  with Tensor.train(False):
+  with Context(TRAINING=0):
     out = model.forward(Tensor(img)).argmax(axis=-1)
   return out.tolist()
 
@@ -72,6 +72,7 @@ class TestEfficientNet(unittest.TestCase):
     self.assertEqual(_LABELS[labels[0]], "hen")
     self.assertEqual(_LABELS[labels[1]], "sports car, sport car")
 
+@unittest.skip("these pretrained models are no longer available")
 class TestViT(unittest.TestCase):
   @classmethod
   def setUpClass(cls):

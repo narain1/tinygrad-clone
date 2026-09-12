@@ -10,7 +10,6 @@ import tensorflow as tf
 import tf2onnx
 from tinygrad.nn.onnx import OnnxRunner
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import to_mv
 from extra.export_model import export_model_clang, compile_net, jit_model
 
 def get_uncompiled_model2(dataset_size=32, output_size=4):
@@ -35,12 +34,11 @@ def compile_onnx_model(onnx_model):
   tinyonnx = TinyOnnx(onnx_model)
   the_input = Tensor.randn(1,32)
 
-  run, special_names = jit_model(tinyonnx, the_input)
+  linear, output_bufs = jit_model(tinyonnx, the_input)
+  the_output = [tinyonnx.forward(the_input)]
 
-  functions, statements, bufs, bufs_to_save = compile_net(run, special_names)
+  functions, statements, bufs, bufs_to_save = compile_net(linear, output_bufs)
   prg = export_model_clang(functions, statements, bufs, {}, ["input0"], ["output0"])
-
-  the_output = run(the_input)
   cprog = ["#include <string.h>", "#include <stdio.h>", "#include <stdlib.h>"]
   cprog.append(prg)
 
@@ -48,8 +46,8 @@ def compile_onnx_model(onnx_model):
   cprog.append("void initialize(float *weights) {")
   weights = bytes()
   for name,cl in bufs_to_save.items():
-    cprog.append(f"memcpy({name}, weights + {len(weights)//4}, {cl._buf.size});")
-    weights += bytes(to_mv(cl._buf.va_addr, cl._buf.size))
+    cprog.append(f"memcpy({name}, weights + {len(weights)//4}, {cl.nbytes});")
+    weights += cl.as_memoryview()
   cprog.append("}")
 
   # write the weights to disk
@@ -98,4 +96,3 @@ if __name__ == "__main__":
   tf_output = keras_model(test_input).numpy()[0]
   print("keras:   ", tf_output, file=sys.stderr)
   np.testing.assert_allclose(tf_output, test_output, atol=1e-5, rtol=1e-5)
-

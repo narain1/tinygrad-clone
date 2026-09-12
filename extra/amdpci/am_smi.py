@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 
 import time, mmap, sys, shutil, os, glob, subprocess, argparse, collections
-from tinygrad.helpers import DEBUG, colored, ansilen
+from tinygrad.helpers import DEBUG, NO_COLOR, colored, ansilen
 from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager, AMPageTableEntry
 from tinygrad.runtime.support.am.ip import AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
 
-def bold(s): return f"\033[1m{s}\033[0m"
+def bold(s): return s if NO_COLOR else f"\033[1m{s}\033[0m"
 
 def trim(s:str, length:int) -> str:
   if len(s) > length: return s[:length-3] + "..."
@@ -64,8 +64,10 @@ def get_bar0_size(pcibus):
 
 class AMSMI(AMDev):
   def __init__(self, pcibus, vram_bar:MMIOInterface, doorbell_bar:MMIOInterface, mmio_bar:MMIOInterface):
-    self.pcibus = pcibus
-    self.vram, self.doorbell64, self.mmio, self.dma_regions = vram_bar, doorbell_bar, mmio_bar, None
+    self.pcibus, self.devfmt = pcibus, pcibus
+    self.vram, self.doorbell64, self.mmio = vram_bar, doorbell_bar, mmio_bar
+    self.is_vf = bool(self.mmio[am.mmRCC_IOV_FUNC_IDENTIFIER] & 1)
+    self.vf_rlc_gated:list[tuple[int, int]] = []
     self.pci_state = self.read_pci_state()
     if self.pci_state == "D0": self._init_from_d0()
 
@@ -84,15 +86,17 @@ class AMSMI(AMDev):
     with open(f"/sys/bus/pci/devices/{self.pcibus}/power_state", "r") as f: return f.read().strip().rstrip()
 
 class SMICtx:
-  def __init__(self):
+  def __init__(self, dev_filter=None):
+    self.dev_filter = dev_filter
     self.devs = []
     self.opened_pcidevs = []
     self.opened_pci_resources = {}
     self.prev_lines_cnt = 0
     self.prev_terminal_width = 0
     self.prev_terminal_height = 0
+    self.prev_metrics = {}
 
-    remove_parts = ["Advanced Micro Devices, Inc. [AMD/ATI]", "VGA compatible controller:"]
+    remove_parts = ["Advanced Micro Devices, Inc. [AMD/ATI]", "VGA compatible controller:", "Processing accelerators:"]
     lspci = subprocess.check_output(["lspci"]).decode("utf-8").splitlines()
     self.lspci = {l.split()[0]: l.split(" ", 1)[1] for l in lspci}
     for k,v in self.lspci.items():
@@ -134,6 +138,7 @@ class SMICtx:
     pattern = os.path.join('/tmp', 'am_*.lock')
     for d in [f[8:-5] for f in glob.glob(pattern)]:
       if d.startswith("usb"): continue
+      if self.dev_filter is not None and d != self.dev_filter: continue
       if d not in self.opened_pcidevs:
         self._open_am_device(d)
 
@@ -153,7 +158,8 @@ class SMICtx:
     tables = {}
     for dev in self.devs:
       match dev.ip_ver[am.MP1_HWIP]:
-        case (13,0,6)|(13,0,12): table_t = dev.smu.smu_mod.MetricsTableX_t
+        case (13,0,6): table_t = dev.smu.smu_mod.MetricsTableV0_t
+        case (13,0,12): table_t = dev.smu.smu_mod.MetricsTable_t
         case _: table_t = dev.smu.smu_mod.SmuMetricsExternal_t
       tables[dev] = dev.smu.read_table(table_t, dev.smu.smu_mod.SMU_TABLE_SMU_METRICS) if dev.pci_state == "D0" else None
     return tables
@@ -230,12 +236,34 @@ class SMICtx:
 
   def get_power(self, dev, metrics):
     match dev.ip_ver[am.MP1_HWIP]:
-      case (13,0,6)|(13,0,12): return self._smuq10_round(metrics.SocketPower), self._smuq10_round(metrics.MaxSocketPowerLimit)
+      case (13,0,6): return self._smuq10_round(metrics.SocketPower), self._smuq10_round(metrics.MaxSocketPowerLimit)
+      case (13,0,12): return self._smuq10_round(metrics.SocketPower), self._smuq10_round(metrics.SocketPowerLimit)
       case _: return metrics.SmuMetrics.AverageSocketPower, metrics.SmuMetrics.dGPU_W_MAX
 
-  def get_mem_usage(self, dev):
-    return 0
+  def get_throttle_info(self, dev, metrics):
+    match dev.ip_ver[am.MP1_HWIP]:
+      case (13,0,6)|(13,0,12):
+        throttle_fields = [('ProchotResidencyAcc', 'Prochot'), ('PptResidencyAcc', 'PPT'),
+                           ('SocketThmResidencyAcc', 'Socket Thm'), ('VrThmResidencyAcc', 'VR Thm'), ('HbmThmResidencyAcc', 'HBM Thm')]
+        prev = self.prev_metrics.get(dev.pcibus)
+        active = []
+        if prev is not None:
+          acc_delta = metrics.AccumulationCounter - prev.AccumulationCounter
+          if acc_delta > 0:
+            for field, name in throttle_fields:
+              delta = getattr(metrics, field) - getattr(prev, field)
+              if delta > 0 and (pct := min(100, (delta * 100 + acc_delta // 2) // acc_delta)) > 0: active.append((name, pct))
+        return active
+      case _:
+        smu_mod = dev.smu.smu_mod
+        throttler_names = {getattr(smu_mod, a): a[len('THROTTLER_'):-len('_BIT')]
+                           for a in dir(smu_mod) if a.startswith('THROTTLER_') and a.endswith('_BIT')}
+        active = []
+        for i, pct in enumerate(metrics.SmuMetrics.ThrottlingPercentage):
+          if pct > 0: active.append((throttler_names.get(i, f"UNK_{i}"), int(pct)))
+        return active
 
+  def get_mem_usage(self, dev):
     usage = 0
     pt_stack = [dev.mm.root_page_table]
     while len(pt_stack) > 0:
@@ -244,15 +272,15 @@ class SMICtx:
         entry = pt.entries[i]
 
         if (entry & am.AMDGPU_PTE_VALID) == 0: continue
-        if pt.lv!=am.AMDGPU_VM_PTB and not dev.gmc.is_pte_huge_page(pt.lv, entry):
-          pt_stack.append(AMPageTableEntry(dev, entry & 0x0000FFFFFFFFF000, lv=pt.lv+1))
+        if pt.lv < am.AMDGPU_VM_PDB0 and not dev.gmc.is_pte_huge_page(pt.lv, entry):
+          pt_stack.append(AMPageTableEntry(dev, dev.xgmi2paddr(entry & 0x0000FFFFFFFFF000), lv=pt.lv+1))
           continue
         if (entry & am.AMDGPU_PTE_SYSTEM) != 0: continue
         usage += (1 << ((9 * (3-pt.lv)) + 12))
     return usage
 
   def draw(self, once):
-    terminal_width, terminal_height = shutil.get_terminal_size()
+    terminal_width, terminal_height = shutil.get_terminal_size(fallback=(231, 24))
     if not once and (self.prev_terminal_width != terminal_width or self.prev_terminal_height != terminal_height):
       os.system('clear')
     self.prev_terminal_width, self.prev_terminal_height = terminal_width, terminal_height
@@ -279,7 +307,14 @@ class SMICtx:
       device_line = [f"{bold(dev.pcibus)} {trim(self.lspci[dev.pcibus[5:]], col_size - 20)}"] + [pad("", col_size)]
       activity_line = [f"GFX Activity {draw_bar(self.get_gfx_activity(dev, metrics) / 100, activity_line_width)}"] \
                     + [f"MEM Activity {draw_bar(self.get_mem_activity(dev, metrics) / 100, activity_line_width)}"] \
-                    + [f"MEM Usage    {draw_bar((mem_used / mem_total) / 100, activity_line_width, opt_text=mem_fmt)}"] \
+                    + [f"MEM Usage    {draw_bar(mem_used / mem_total, activity_line_width, opt_text=mem_fmt)}"] \
+
+      throttle_info = self.get_throttle_info(dev, metrics)
+      if throttle_info:
+        throttle_text = colored(', '.join(f"{name} {pct}%" for name, pct in throttle_info), "red")
+      else:
+        throttle_text = colored("None", "green")
+      activity_line += [f"Throttle     {throttle_text}" + " " * (activity_line_width + 2)]
 
       temps_data, temps_data_compact = self.get_temps(dev, metrics), self.get_temps(dev, metrics, compact=True)
       temps_table = ["=== Temps (°C) ==="] + [f"{name:<16}: {color_temp(val)}" for name, val in temps_data.items()]
@@ -323,6 +358,8 @@ class SMICtx:
         activity_line += power_line_compact
 
       dev_content.append(device_line + activity_line + same_line([temps_table, power_table, frequency_table]))
+
+    self.prev_metrics = {dev.pcibus: m for dev, m in dev_metrics.items() if m is not None}
 
     raw_text = 'AM Monitor'.center(terminal_width) + "\n" + "=" * terminal_width + "\n\n"
     for i in range(0, len(dev_content), 2):
@@ -373,7 +410,7 @@ if __name__ == "__main__":
 
   try:
     if not args.list: os.system('clear')
-    smi_ctx = SMICtx()
+    smi_ctx = SMICtx(args.dev)
     while True:
       smi_ctx.rescan_devs()
       smi_ctx.draw(args.list)

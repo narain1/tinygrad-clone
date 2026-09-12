@@ -3,12 +3,12 @@ import functools, pickle
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import tqdm, temp, time_to_str, cpu_profile
 
-BENCHMARK_OPS = {Ops.INDEX, Ops.BUFFERIZE}
+BENCHMARK_OPS = {Ops.INDEX, Ops.STAGE}
 
 @functools.cache
 def create_uop(a:int) -> UOp:
-  op, dtype, src, arg, *rest = trace.uop_fields[a]
-  return UOp(op, dtype, tuple(create_uop(s) for s in src), arg, *rest)
+  op, src, arg, *rest = trace.uop_fields[a]
+  return UOp(op, tuple(create_uop(s) for s in src), arg, *rest)
 
 if __name__ == "__main__":
   # load rewrite trace
